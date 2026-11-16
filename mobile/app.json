@@ -1,0 +1,32 @@
+{
+  "expo": {
+    "name": "bat-sense",
+    "slug": "bat-sense",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0b0f14",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.batsense.app",
+      "infoPlist": {
+        "NSAppTransportSecurity": { "NSAllowsLocalNetworking": true },
+        "NSLocalNetworkUsageDescription": "bat-sense connects to your PC on the local network to send motion data."
+      }
+    },
+    "android": {
+      "package": "com.batsense.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#0b0f14",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      }
+    },
+    "plugins": [
+      ["expo-sensors", { "motionPermission": "bat-sense uses the motion sensors to control your game." }],
+      ["expo-build-properties", { "android": { "usesCleartextTraffic": true } }]
+    ]
+  }
+}
