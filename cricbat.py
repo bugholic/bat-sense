@@ -1,25 +1,28 @@
 """
 Phone-as-controller bridge (PCSX2 / any PC game).
 
+    python cricbat.py train                      # trains the game selected in the app
+    python cricbat.py train --only left,right    # re-train some actions
+    python cricbat.py play                       # plays the game selected in the app
     python cricbat.py list
-    python cricbat.py train cricket07            # guided calibration, saves profiles/cricket07.json
-    python cricbat.py train cricket07 --only left,right   # re-train some actions
-    python cricbat.py train mygame               # no template -> interactive action wizard
-    python cricbat.py play  cricket07            # live play with the trained profile
 
-The phone page streams JSON over WebSocket (port 8765):
-    {"acceleration": {x,y,z}, "rotation": {alpha,beta,gamma}}
+Games and their actions are defined in the app; it sends them on connect:
+    {"type":"setup", "game":..., "actions":[{name, type:"tilt"|"swing", key}]}
+then streams motion frames {"acceleration": {x,y,z}, "rotation": {alpha,beta,gamma}} and
+on-screen pad edges {"type":"key", key, down} over WebSocket (port 8765).
 """
 import argparse
 import asyncio
 import ctypes
 import json
 import math
+import re
 import socket
 import statistics
 import sys
 import time
 from dataclasses import dataclass
+from http import HTTPStatus
 from pathlib import Path
 
 import websockets
@@ -27,6 +30,7 @@ import win32con
 import win32gui
 
 PORT = 8765
+DISCOVERY_PATH = "/batsense"   # must match mobile/connect.js
 PROFILE_DIR = Path(__file__).with_name("profiles")
 
 # ─── Training / engine tuning ────────────────────────────────────────────────
@@ -78,7 +82,9 @@ SPECIAL_VK = {
     "up": win32con.VK_UP,     "down": win32con.VK_DOWN,
     "space": 0x20, "enter": 0x0D, "shift": 0x10, "ctrl": 0x11,
     "alt": 0x12,   "tab": 0x09,   "esc": 0x1B,
-}
+    "backspace": 0x08, "delete": 0x2E, "insert": 0x2D,
+    "home": 0x24, "end": 0x23, "pgup": 0x21, "pgdn": 0x22,
+}   # keep in sync with SPECIAL in mobile/Pad.js
 
 def vk_for(key: str):
     k = key.lower()
@@ -112,6 +118,34 @@ def key_up(key: str):
     vk = vk_for(key)
     if vk is not None:
         _send(vk, KEYEVENTF_KEYUP)
+
+class KeyMux:
+    """
+    Shared physical key state. Several sources (motion engine, on-screen pad) can hold the
+    same key; it goes down on the first hold and up only when the last holder releases it.
+    """
+    def __init__(self, down=key_down, up=key_up):
+        self.down, self.up = down, up
+        self.holders = {}            # key -> set of owners
+
+    def press(self, key: str, owner: str):
+        h = self.holders.setdefault(key, set())
+        if not h:
+            self.down(key)
+        h.add(owner)
+
+    def release(self, key: str, owner: str):
+        h = self.holders.get(key)
+        if not h or owner not in h:
+            return
+        h.discard(owner)
+        if not h:
+            del self.holders[key]
+            self.up(key)
+
+    def release_owner(self, owner: str):
+        for key in [k for k, h in self.holders.items() if owner in h]:
+            self.release(key, owner)
 
 # ─── Sensor samples ──────────────────────────────────────────────────────────
 @dataclass
@@ -307,10 +341,6 @@ class Trainer:
                     "threshold": round(thr, 1)}
 
     async def run(self, game, profile, only):
-        print("\nWaiting for the phone to start streaming...")
-        await self.seen.wait()
-        print("[+] Receiving sensor data.")
-
         profile["rest"] = await self.measure_rest()
         for name, spec in profile["actions"].items():
             if only and name not in only:
@@ -328,7 +358,7 @@ class Trainer:
 
         save_profile(game, profile)
         print(f"\n[OK] Saved {profile_path(game)}")
-        print(f"     Play with:  python cricbat.py play {game}")
+        print(f"     Play with:  python cricbat.py play")
 
 # ─── Window helper (informational) ───────────────────────────────────────────
 def find_window(patterns):
@@ -357,6 +387,40 @@ def lan_ip() -> str:
     finally:
         s.close()
 
+def print_connect_info():
+    """The app finds the PC on its own (subnet probe of DISCOVERY_PATH). The QR code / code are
+    fallbacks for networks where that scan can't work."""
+    ip = lan_ip()
+    print(f"\n  The app finds this PC automatically when you tap Start.")
+    print(f"  If it doesn't: scan this QR in the app, or type  {ip}  (or just  {ip.rsplit('.', 1)[-1]} ).")
+    try:
+        import qrcode
+        qr = qrcode.QRCode(border=1)
+        qr.add_data(f"batsense://{ip}:{PORT}")
+        qr.print_ascii(invert=True)
+    except ImportError:
+        print("  (pip install qrcode  to show a QR code here)")
+
+# Names arrive from the phone and become file names under profiles/ - never trust them.
+NAME_RE = re.compile(r"^[a-z0-9_-]{1,24}$")
+
+def parse_setup(data: dict):
+    """{"type":"setup","game":..,"actions":[{name,type,key}]} -> (game, {name: spec}) or None."""
+    game = str(data.get("game", "")).strip().lower()
+    if not NAME_RE.match(game):
+        print(f"[WARN] Phone sent an invalid game name {game!r}")
+        return None
+    actions = {}
+    for a in data.get("actions") or []:
+        if not isinstance(a, dict):
+            continue
+        name, kind, key = (str(a.get(k, "")).strip().lower() for k in ("name", "type", "key"))
+        if not NAME_RE.match(name) or kind not in ("tilt", "swing") or vk_for(key) is None or name in actions:
+            print(f"[WARN] Skipping invalid action from phone: {a}")
+            continue
+        actions[name] = {"type": kind, "key": key}
+    return game, actions
+
 _clients = set()
 
 def announce(text: str, count=None, go=False):
@@ -366,19 +430,41 @@ def announce(text: str, count=None, go=False):
     for ws in list(_clients):
         asyncio.ensure_future(ws.send(msg))
 
-async def serve(consumer, on_disconnect=lambda: None):
+def discovery_probe(connection, request):
+    """Plain HTTP GET on DISCOVERY_PATH answers the app's subnet scan; anything else is a WebSocket."""
+    if request.path == DISCOVERY_PATH:
+        return connection.respond(HTTPStatus.OK, json.dumps({"app": "bat-sense", "name": socket.gethostname()}))
+    return None
+
+async def serve(consumer, on_disconnect=lambda: None, on_key=None, on_setup=None, on_connect=lambda: None):
+    """consumer(Sample) gets motion frames; on_key(key, down) gets on-screen pad edges;
+    on_setup(game, actions) gets the game definition the app sends right after connecting."""
     msg_count = 0
 
     async def handler(ws):
         nonlocal msg_count
         print("\n[+] Mobile connected!")
         _clients.add(ws)
+        on_connect()
         try:
             async for message in ws:
                 try:
-                    s = parse_sample(json.loads(message))
+                    data = json.loads(message)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(data, dict):
+                    continue
+                kind = data.get("type")
+                if kind == "key":
+                    if on_key:
+                        on_key(str(data.get("key", "")), bool(data.get("down")))
+                    continue
+                if kind == "setup":
+                    parsed = parse_setup(data)
+                    if parsed and on_setup:
+                        on_setup(*parsed)
+                    continue
+                s = parse_sample(data)
                 if s is None:
                     continue
                 msg_count += 1
@@ -390,82 +476,144 @@ async def serve(consumer, on_disconnect=lambda: None):
             on_disconnect()          # never leave a key stuck down
             print("[-] Mobile disconnected")
 
-    print(f"\n  In the bat-sense app, enter this PC address:  {lan_ip()}   (port {PORT})")
-    async with websockets.serve(handler, "0.0.0.0", PORT):
+    print_connect_info()
+    async with websockets.serve(handler, "0.0.0.0", PORT, process_request=discovery_probe):
         await asyncio.Future()
 
 # ─── Commands ────────────────────────────────────────────────────────────────
-async def ask(prompt):
-    return (await asyncio.get_running_loop().run_in_executor(None, input, prompt)).strip()
+def merge_actions(profile: dict, phone_actions: dict) -> dict:
+    """The app is the source of truth for which actions exist and their keys. Trained data
+    (axis/sign/threshold) is kept for actions whose name and type are unchanged."""
+    old = profile.get("actions", {})
+    merged = {}
+    for name, spec in phone_actions.items():
+        prev = old.get(name)
+        merged[name] = {**prev, "key": spec["key"]} if prev and prev.get("type") == spec["type"] else dict(spec)
+    profile["actions"] = merged
+    return profile
 
-async def wizard():
-    """Define actions for a game that has no template."""
-    print("Define the game's actions. Blank name to finish.")
-    actions = {}
-    while True:
-        name = await ask("  action name (e.g. jump, left): ")
-        if not name:
-            break
-        kind = await ask("    type [tilt/swing] (tilt = hold while tilted, swing = tap on flick): ")
-        key  = await ask("    keyboard key to press (e.g. z, left, space): ")
-        if kind not in ("tilt", "swing") or vk_for(key) is None:
-            print("    invalid type or key, skipped")
-            continue
-        actions[name] = {"type": kind, "key": key}
-    pat = await ask("  window title contains (optional, e.g. pcsx2): ")
-    return {"window_match": [pat.lower()] if pat else [], "actions": actions}
+def base_profile(game: str) -> dict:
+    return load_profile(game) or json.loads(json.dumps(TEMPLATES.get(game, {"window_match": [], "actions": {}})))
 
 async def cmd_train(args):
-    existing = load_profile(args.game)
-    if existing:
-        profile = existing
-    elif args.game in TEMPLATES:
-        profile = json.loads(json.dumps(TEMPLATES[args.game]))
-    else:
-        profile = await wizard()
-    if not profile["actions"]:
-        print("No actions defined."); return
-    profile["game"] = args.game
-    only = set(args.only.split(",")) if args.only else None
-    if only and not only <= set(profile["actions"]):
-        print(f"Unknown action(s): {only - set(profile['actions'])}"); return
-
     trainer = Trainer()
-    print("=" * 55)
-    print(f"  TRAINING: {args.game}   actions: {', '.join(profile['actions'])}")
-    print(f"  Open the phone page and connect to ws://<this-pc-ip>:{PORT}")
-    print("=" * 55)
-    server = asyncio.create_task(serve(trainer.feed))
-    run = asyncio.create_task(trainer.run(args.game, profile, only))
-    done, _ = await asyncio.wait({server, run}, return_when=asyncio.FIRST_COMPLETED)
-    for t in (server, run):
+    setup = {}
+
+    def on_setup(game, actions):
+        if args.game and game != args.game:
+            print(f"[WARN] The app is set to '{game}' but you asked to train '{args.game}'. "
+                  f"Using the saved actions for '{args.game}' - pick '{args.game}' in the app to edit them.")
+            return
+        setup["game"], setup["actions"] = game, actions
+
+    async def run():
+        print("\nWaiting for the phone (tap Start in the app)...")
+        await trainer.seen.wait()            # the app sends its setup before the first motion frame
+        game = args.game or setup.get("game")
+        if not game:
+            raise RuntimeError("The app didn't say which game to train - update the app, or pass a game name.")
+        profile = base_profile(game)
+        if setup.get("actions"):
+            merge_actions(profile, setup["actions"])
+        if not profile["actions"]:
+            raise RuntimeError(f"'{game}' has no motion actions. Add them in the app (Setup) and tap Start again.")
+        profile["game"] = game
+
+        only = set(args.only.split(",")) if args.only else None
+        if only:
+            if not only <= set(profile["actions"]):
+                raise RuntimeError(f"Unknown action(s): {', '.join(only - set(profile['actions']))}")
+            untrained = {n for n, a in profile["actions"].items() if "threshold" not in a}
+            if untrained - only:
+                print(f"[INFO] Also training new/changed action(s): {', '.join(sorted(untrained - only))}")
+            only |= untrained
+
+        print("=" * 55)
+        print(f"  TRAINING: {game}   actions: {', '.join(profile['actions'])}")
+        print("=" * 55)
+        await trainer.run(game, profile, only)
+
+    server = asyncio.create_task(serve(trainer.feed, on_setup=on_setup))
+    task = asyncio.create_task(run())
+    done, _ = await asyncio.wait({server, task}, return_when=asyncio.FIRST_COMPLETED)
+    for t in (server, task):
         t.cancel()
     for t in done:
         if t.exception():
             print(f"[ERROR] {t.exception()}")
 
 async def cmd_play(args):
-    profile = load_profile(args.game)
-    if not profile:
+    if args.game and not load_profile(args.game):
         print(f"No profile '{args.game}'. Run:  python cricbat.py train {args.game}"); return
     loop = asyncio.get_running_loop()
-    engine = Engine(profile, key_down, key_up, loop.call_later)
+    mux = KeyMux()
+    state = {"game": None, "engine": None}
+    bad_keys = set()
 
-    print("=" * 55)
-    print(f"  PLAY: {args.game}")
-    for n, a in profile["actions"].items():
-        extra = f"{a['axis']}{'+' if a['sign'] > 0 else '-'}" if a["type"] == "tilt" else "flick"
-        print(f"    {n:<8} {a['type']:<5} key={a['key']:<6} {extra:<7} trigger={a['threshold']}")
-    print("=" * 55)
-    w = find_window(profile.get("window_match", []))
-    print(f"[INFO] Game window: {w!r}" if w else "[WARN] Game window not found - open it, keys go to the focused window.")
-    print("Waiting for mobile connection... (console will minimize)\n")
-    if not args.no_minimize:
-        minimize_console()
+    def load(game, phone_actions=None):
+        profile = load_profile(game)
+        if not profile:
+            print(f"[WARN] '{game}' isn't trained yet. Run:  python cricbat.py train"); return
+        if phone_actions is not None:
+            merge_actions(profile, phone_actions)      # key changes in the app apply without retraining
+        trained = {n: a for n, a in profile["actions"].items() if "threshold" in a}
+        for n in profile["actions"].keys() - trained.keys():
+            print(f"[WARN] '{n}' is new or changed in the app - re-train to use it:  python cricbat.py train --only {n}")
+        profile["actions"] = trained
+        if state["engine"]:
+            state["engine"].release_all()
+        state["game"] = game
+        state["engine"] = Engine(profile, lambda k: mux.press(k, "motion"), lambda k: mux.release(k, "motion"),
+                                 loop.call_later)
+        print("=" * 55)
+        print(f"  PLAY: {game}")
+        for n, a in trained.items():
+            extra = f"{a['axis']}{'+' if a['sign'] > 0 else '-'}" if a["type"] == "tilt" else "flick"
+            print(f"    {n:<8} {a['type']:<5} key={a['key']:<6} {extra:<7} trigger={a['threshold']}")
+        print("=" * 55)
+        w = find_window(profile.get("window_match", []))
+        print(f"[INFO] Game window: {w!r}" if w else "[WARN] Game window not found - open it, keys go to the focused window.")
+
+    def on_setup(game, actions):
+        if args.game and game != args.game:
+            print(f"[WARN] The app is set to '{game}', playing '{args.game}' as requested."); return
+        load(game, actions)
+
+    def on_pad_key(key: str, down: bool):
+        key = key.strip().lower()
+        if vk_for(key) is None:
+            if key not in bad_keys:
+                bad_keys.add(key)
+                print(f"[WARN] Pad sent unknown key {key!r} - fix it under Setup in the app")
+            return
+        if down:
+            mux.press(key, "pad");  print(f"  ● pad      {key}")
+        else:
+            mux.release(key, "pad")
+
+    def feed(s):
+        if state["engine"]:
+            state["engine"].feed(s)
+
+    def release_everything():          # never leave a key stuck down
+        if state["engine"]:
+            state["engine"].release_all()
+        mux.release_owner("pad")
+
+    minimized = False
+    def on_connect():                  # minimize only once connected, so the QR stays visible until then
+        nonlocal minimized
+        if not minimized and not args.no_minimize:
+            minimized = True
+            minimize_console()
+
+    if args.game:
+        load(args.game)
+    print("Waiting for the phone (tap Start in the app)...")
     try:
-        await serve(engine.feed, engine.release_all)
+        await serve(feed, release_everything, on_pad_key, on_setup, on_connect)
     finally:
-        engine.release_all()
+        release_everything()
 
 def cmd_list():
     names = sorted(p.stem for p in PROFILE_DIR.glob("*.json")) if PROFILE_DIR.exists() else []
@@ -478,10 +626,12 @@ def main():
             stream.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description="Phone motion → keyboard bridge")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    t = sub.add_parser("train", help="calibrate a game profile")
-    t.add_argument("game"); t.add_argument("--only", help="comma list of actions to re-train")
-    p = sub.add_parser("play", help="run a trained profile")
-    p.add_argument("game"); p.add_argument("--no-minimize", action="store_true")
+    t = sub.add_parser("train", help="calibrate the game selected in the app")
+    t.add_argument("game", nargs="?", help="optional; defaults to the game selected in the app")
+    t.add_argument("--only", help="comma list of actions to re-train")
+    p = sub.add_parser("play", help="play the game selected in the app")
+    p.add_argument("game", nargs="?", help="optional; defaults to the game selected in the app")
+    p.add_argument("--no-minimize", action="store_true")
     sub.add_parser("list", help="list profiles")
     args = ap.parse_args()
     if args.cmd == "list":

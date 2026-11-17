@@ -26,6 +26,7 @@
     },
     "plugins": [
       ["expo-sensors", { "motionPermission": "bat-sense uses the motion sensors to control your game." }],
+      ["expo-camera", { "cameraPermission": "bat-sense uses the camera to scan the QR code shown by your PC.", "microphonePermission": false, "recordAudioAndroid": false }],
       ["expo-build-properties", { "android": { "usesCleartextTraffic": true } }]
     ]
   }
